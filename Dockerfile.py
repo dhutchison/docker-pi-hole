@@ -1,9 +1,8 @@
 #!/usr/bin/env python
-
 """ Dockerfile.py - generates and build dockerfiles
 
 Usage:
-  Dockerfile.py [--arch=<arch> ...] [--skip=<arch> ...] [-v] [--no-build | --no-generate] [--no-cache]
+  Dockerfile.py [--arch=<arch> ...] [--skip=<arch> ...] [-v] [-t] [--no-build | --no-generate] [--no-cache]
 
 Options:
     --no-build      Skip building the docker images
@@ -12,22 +11,25 @@ Options:
     --arch=<arch>   What Architecture(s) to build   [default: amd64 armel armhf aarch64]
     --skip=<arch>   What Architectures(s) to skip   [default: None]
     -v              Print docker's command output   [default: False]
+    -t              Print docker's build time       [default: False]
 
 Examples:
 """
+from __future__ import print_function
 
 from docopt import docopt
 from jinja2 import Environment, FileSystemLoader
 from docopt import docopt
 import os
-import testinfra
+import subprocess
+import sys
 
 THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 
 base_vars = {
     'name': 'pihole/pihole',
     'maintainer' : 'adam@diginc.us',
-    's6_version' : 'v1.21.4.0',
+    's6_version' : 'v1.21.7.0',
 }
 
 os_base_vars = {
@@ -35,10 +37,16 @@ os_base_vars = {
     'php_error_log': '/var/log/lighttpd/error.log'
 }
 
+__version__ = None
+dot = os.path.abspath('.')
+with open('{}/VERSION'.format(dot), 'r') as v:
+    raw_version = v.read().strip()
+    __version__ = raw_version.replace('release/', 'release-')
+
 images = {
-    'v4.0': [
+    __version__: [
         {
-            'base': 'debian:stretch',
+            'base': 'pihole/debian-base:latest',
             'arch': 'amd64'
         },
         {
@@ -58,7 +66,7 @@ images = {
 
 def generate_dockerfiles(args):
     if args['--no-generate']:
-        print " ::: Skipping Dockerfile generation"
+        print(" ::: Skipping Dockerfile generation")
         return
 
     for version, archs in images.iteritems():
@@ -86,38 +94,41 @@ def generate_dockerfiles(args):
 
 def build_dockerfiles(args):
     if args['--no-build']:
-        print " ::: Skipping Dockerfile building"
+        print(" ::: Skipping Dockerfile building")
         return
 
     for arch in args['--arch']:
         # TODO: include from external .py that can be shared with Dockerfile.py / Tests / deploy scripts '''
-        build('pihole', 'v4.0', arch, args)
+        if arch == 'armel':
+            print("Skipping armel, incompatible upstream binaries/broken")
+            continue
+        build('pihole', arch, args)
 
 
-def build(docker_repo, version, arch, args):
-    run_local = testinfra.get_backend(
-        "local://"
-    ).get_module("Command").run
-
+def build(docker_repo, arch, args):
     dockerfile = 'Dockerfile_{}'.format(arch)
-    repo_tag = '{}:{}_{}'.format(docker_repo, version, arch)
+    repo_tag = '{}:{}_{}'.format(docker_repo, __version__, arch)
     cached_image = '{}/{}'.format('pihole', repo_tag)
+    time=''
+    if args['-t']:
+        time='time '
     no_cache = ''
     if args['--no-cache']:
         no_cache = '--no-cache'
-    build_command = 'docker build {no_cache} --pull --cache-from="{cache},{create_tag}" -f {dockerfile} -t {create_tag} .'\
-        .format(no_cache=no_cache, cache=cached_image, dockerfile=dockerfile, create_tag=repo_tag)
-    print " ::: Building {} into {}".format(dockerfile, repo_tag)
+    build_command = '{time}docker build {no_cache} --pull --cache-from="{cache},{create_tag}" -f {dockerfile} -t {create_tag} .'\
+        .format(time=time, no_cache=no_cache, cache=cached_image, dockerfile=dockerfile, create_tag=repo_tag)
+    print(" ::: Building {} into {}".format(dockerfile, repo_tag))
     if args['-v']:
-        print build_command, '\n'
-    build_result = run_local(build_command) 
+        print(build_command, '\n')
+    build_result = subprocess.Popen(build_command.split(), stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     if args['-v']:
-        print build_result.stdout
-        print build_result.stderr
-    if build_result.rc != 0:
-        print "     ::: Building {} encountered an error".format(dockerfile)
-        print build_result.stderr
-    assert build_result.rc == 0
+        for c in iter(lambda: build_result.stdout.read(1), b''):
+            sys.stdout.write(c)
+    build_result.wait()
+    if build_result.returncode != 0:
+        print("     ::: Building {} encountered an error".format(dockerfile))
+        print(build_result.stderr)
+    assert build_result.returncode == 0
 
 
 if __name__ == '__main__':

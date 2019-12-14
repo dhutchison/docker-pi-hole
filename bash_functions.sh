@@ -1,4 +1,40 @@
 #!/bin/bash
+# Some of the bash_functions use variables these core pi-hole/web scripts
+. /opt/pihole/webpage.sh
+
+docker_checks() {
+    warn_msg='WARNING Misconfigured DNS in /etc/resolv.conf'
+    ns_count="$(grep -c nameserver /etc/resolv.conf)"
+    ns_primary="$(grep nameserver /etc/resolv.conf | head -1)"
+    ns_primary="${ns_primary/nameserver /}"
+    warned=false
+
+    if [ "$ns_count" -lt 2 ] ; then
+        echo "$warn_msg: Two DNS servers are recommended, 127.0.0.1 and any backup server"
+        warned=true
+    fi
+
+    if [ "$ns_primary" != "127.0.0.1" ] ; then
+        echo "$warn_msg: Primary DNS should be 127.0.0.1 (found ${ns_primary})"
+        warned=true
+    fi
+
+    if ! $warned ; then
+        echo "OK: Checks passed for /etc/resolv.conf DNS servers"
+    fi
+
+    echo
+    cat /etc/resolv.conf
+}
+
+fix_capabilities() {
+    setcap CAP_NET_BIND_SERVICE,CAP_NET_RAW,CAP_NET_ADMIN+ei $(which pihole-FTL) || ret=$?
+
+    if [[ $ret -ne 0 && "${DNSMASQ_USER:-root}" != "root" ]]; then
+        echo "ERROR: Failed to set capabilities for pihole-FTL. Cannot run as non-root."
+        exit 1
+    fi
+}
 
 prepare_configs() {
     # Done in /start.sh, don't do twice
@@ -9,6 +45,7 @@ prepare_configs() {
     set +e
     mkdir -p /var/run/pihole /var/log/pihole
     # Re-apply perms from basic-install over any volume mounts that may be present (or not)
+    # Also  similar to preflights for FTL https://github.com/pi-hole/pi-hole/blob/master/advanced/Templates/pihole-FTL.service
     chown pihole:root /etc/lighttpd
     chown pihole:pihole "${PI_HOLE_CONFIG_DIR}/pihole-FTL.conf" "/var/log/pihole" "${regexFile}"
     chmod 644 "${PI_HOLE_CONFIG_DIR}/pihole-FTL.conf" 
@@ -32,15 +69,13 @@ prepare_configs() {
         # Stash and pop the user password to avoid setting the password to the hashed setupVar variable
         WEBPASSWORD="${USERWEBPASSWORD}"
         # Clean up old before re-writing the required setupVars
-        sed -i.update.bak '/PIHOLE_INTERFACE/d;/IPV4_ADDRESS/d;/IPV6_ADDRESS/d;/PIHOLE_DNS_1/d;/PIHOLE_DNS_2/d;/QUERY_LOGGING/d;/INSTALL_WEB_SERVER/d;/INSTALL_WEB_INTERFACE/d;/LIGHTTPD_ENABLED/d;' "${setupVars}"
+        sed -i.update.bak '/PIHOLE_INTERFACE/d;/IPV4_ADDRESS/d;/IPV6_ADDRESS/d;/QUERY_LOGGING/d;/INSTALL_WEB_SERVER/d;/INSTALL_WEB_INTERFACE/d;/LIGHTTPD_ENABLED/d;' "${setupVars}"
     fi
     # echo the information to the user
     {
     echo "PIHOLE_INTERFACE=${PIHOLE_INTERFACE}"
     echo "IPV4_ADDRESS=${IPV4_ADDRESS}"
     echo "IPV6_ADDRESS=${IPV6_ADDRESS}"
-    echo "PIHOLE_DNS_1=${PIHOLE_DNS_1}"
-    echo "PIHOLE_DNS_2=${PIHOLE_DNS_2}"
     echo "QUERY_LOGGING=${QUERY_LOGGING}"
     echo "INSTALL_WEB_SERVER=${INSTALL_WEB_SERVER}"
     echo "INSTALL_WEB_INTERFACE=${INSTALL_WEB_INTERFACE}"
@@ -49,12 +84,7 @@ prepare_configs() {
 }
 
 validate_env() {
-    if [ -z "$ServerIP" ] ; then
-      echo "ERROR: To function correctly you must pass an environment variables of 'ServerIP' into the docker container with the IP of your docker host from which you are passing web (80) and dns (53) ports from"
-      exit 1
-    fi;
-
-    # Required ServerIP is a valid IP
+    # Optional ServerIP is a valid IP
     # nc won't throw any text based errors when it times out connecting to a valid IP, otherwise it complains about the DNS name being garbage
     # if nc doesn't behave as we expect on a valid IP the routing table should be able to look it up and return a 0 retcode
     if [[ "$(nc -4 -w1 -z "$ServerIP" 53 2>&1)" != "" ]] || ! ip route get "$ServerIP" > /dev/null ; then
@@ -86,14 +116,17 @@ setup_dnsmasq_dns() {
         dnsType='custom'
     fi;
 
+    # TODO With the addition of this to /start.sh this needs a refactor
     if [ ! -f /.piholeFirstBoot ] ; then
         local setupDNS1="$(grep 'PIHOLE_DNS_1' ${setupVars})"
         local setupDNS2="$(grep 'PIHOLE_DNS_2' ${setupVars})"
+        setupDNS1="${setupDNS1/PIHOLE_DNS_1=/}"
+        setupDNS2="${setupDNS2/PIHOLE_DNS_2=/}"
         if [[ -n "$DNS1" && -n "$setupDNS1"  ]] || \
            [[ -n "$DNS2" && -n "$setupDNS2"  ]] ; then 
                 echo "Docker DNS variables not used"
         fi
-        echo "Existing DNS servers used"
+        echo "Existing DNS servers used (${setupDNS1:-unset} & ${setupDNS2:-unset})"
         return
     fi
 
@@ -102,8 +135,9 @@ setup_dnsmasq_dns() {
         change_setting "PIHOLE_DNS_1" "${DNS1}"
     fi
     if [[ -n "$DNS2" && -z "$setupDNS2" ]] ; then
-        if [ "$DNS2" = "no" ] ; then
+        if [[ "$DNS2" == "no" ]] ; then
             delete_setting "PIHOLE_DNS_2"
+            unset PIHOLE_DNS_2
         else
             change_setting "PIHOLE_DNS_2" "${DNS2}"
         fi
@@ -120,6 +154,14 @@ setup_dnsmasq_interface() {
     [ -n "$interface" ] && change_setting "PIHOLE_INTERFACE" "${interface}"
 }
 
+setup_dnsmasq_listening_behaviour() {
+    local dnsmasq_listening_behaviour="${1}"
+
+    if [ -n "$dnsmasq_listening_behaviour" ]; then
+      change_setting "DNSMASQ_LISTENING" "${dnsmasq_listening_behaviour}"
+    fi;
+}
+
 setup_dnsmasq_config_if_missing() {
     # When fresh empty directory volumes are used we miss this file
     if [ ! -f /etc/dnsmasq.d/01-pihole.conf ] ; then
@@ -131,11 +173,28 @@ setup_dnsmasq() {
     local dns1="$1"
     local dns2="$2"
     local interface="$3"
+    local dnsmasq_listening_behaviour="$4"
     # Coordinates 
     setup_dnsmasq_config_if_missing
     setup_dnsmasq_dns "$dns1" "$dns2" 
     setup_dnsmasq_interface "$interface"
+    setup_dnsmasq_listening_behaviour "$dnsmasq_listening_behaviour"
+    setup_dnsmasq_user "${DNSMASQ_USER}"
     ProcessDNSSettings
+}
+
+setup_dnsmasq_user() {
+    local DNSMASQ_USER="${1}"
+
+    # Run DNSMASQ as root user to avoid SHM permission issues
+    if grep -r -q '^\s*user=' /etc/dnsmasq.* ; then
+        # Change user that had been set previously to root
+        for f in $(grep -r -l '^\s*user=' /etc/dnsmasq.*); do
+            sed -i "/^\s*user=/ c\user=${DNSMASQ_USER}" "${f}"
+        done
+    else
+      echo -e "\nuser=${DNSMASQ_USER}" >> /etc/dnsmasq.conf
+    fi
 }
 
 setup_dnsmasq_hostnames() {
@@ -231,23 +290,34 @@ setup_web_port() {
 
 }
 
-setup_web_password() {
+generate_password() {
     if [ -z "${WEBPASSWORD+x}" ] ; then
         # Not set at all, give the user a random pass
         WEBPASSWORD=$(tr -dc _A-Z-a-z-0-9 < /dev/urandom | head -c 8)
         echo "Assigning random password: $WEBPASSWORD"
     fi;
+}
+
+setup_web_password() {
+    setup_var_exists "WEBPASSWORD" && return
+
+    PASS="$1"
     # Turn bash debug on while setting up password (to print it)
-    set -x
-    if [[ "$WEBPASSWORD" == "" ]] ; then
+    if [[ "$PASS" == "" ]] ; then
         echo "" | pihole -a -p
     else
-        pihole -a -p "$WEBPASSWORD" "$WEBPASSWORD"
+        echo "Setting password: ${PASS}"
+        set -x
+        pihole -a -p "$PASS" "$PASS"
     fi
+    # Turn bash debug back off after print password setup
+    # (subshell to null hides printing output)
+    { set +x; } 2>/dev/null
+
+    # To avoid printing this if conditional in bash debug, turn off  debug above..
+    # then re-enable debug if necessary (more code but cleaner printed output)
     if [ "${PH_VERBOSE:-0}" -gt 0 ] ; then
-        # Turn bash debug back off after print password setup
-        # (subshell to null hides printing output)
-        { set +x; } 2>/dev/null
+        set -x
     fi
 }
 
@@ -262,10 +332,8 @@ setup_ipv4_ipv6() {
 
 test_configs() {
     set -e
-    echo -n '::: Testing pihole-FTL configs: '
-    pihole-FTL test || exit 1
-    echo -n '::: Testing pihole-dnsmasq configs: '
-    pihole-FTL dnsmasq-test || exit 1
+    echo -n '::: Testing pihole-FTL DNS: '
+    sudo -u ${DNSMASQ_USER:-root} pihole-FTL test || exit 1
     echo -n '::: Testing lighttpd config: '
     lighttpd -t -f /etc/lighttpd/lighttpd.conf || exit 1
     set +e
@@ -276,11 +344,11 @@ test_configs() {
 setup_blocklists() {
     local blocklists="$1"   
     # Exit/return early without setting up adlists with defaults for any of the following conditions:
-    # 1. NO_SETUP env is set
+    # 1. skip_setup_blocklists env is set
     exit_string="(exiting ${FUNCNAME[0]} early)"
 
-    if [ -n "${NO_SETUP}" ]; then
-        echo "::: NO_SETUP requested ($exit_string)"
+    if [ -n "${skip_setup_blocklists}" ]; then
+        echo "::: skip_setup_blocklists requested ($exit_string)"
         return
     fi
 
@@ -291,29 +359,24 @@ setup_blocklists() {
         return
     fi
 
-    # 3. If we're running tests, use a small list of fake tests to speed everything up
-    if [ -n "$PYTEST" ]; then 
-        echo ":::::: Tests are being ran - stub out ad list fetching and add a fake ad block ${exit_string}"
-        sed -i 's/^gravity_spinup$/#gravity_spinup # DISABLED FOR PYTEST/g' "$(which gravity.sh)" 
-        echo '123.123.123.123 testblock.pi-hole.local' > "/var/www/html/fake.list"
-        echo 'file:///var/www/html/fake.list' > "${adlistFile}"
-        echo 'http://localhost/fake.list' >> "${adlistFile}"
-        return
-    fi
-
     echo "::: ${FUNCNAME[0]} now setting default blocklists up: "
     echo "::: TIP: Use a docker volume for ${adlistFile} if you want to customize for first boot"
-    > "${adlistFile}"
-    # Just copied outa the choices for now
-    # https://github.com/pi-hole/pi-hole/blob/FTLDNS/automated%20install/basic-install.sh#L1014
-    echo "https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts" >> "${adlistFile}"
-    echo "https://mirror1.malwaredomains.com/files/justdomains" >> "${adlistFile}"
-    echo "http://sysctl.org/cameleon/hosts" >> "${adlistFile}"
-    echo "https://zeustracker.abuse.ch/blocklist.php?download=domainblocklist" >> "${adlistFile}"
-    echo "https://s3.amazonaws.com/lists.disconnect.me/simple_tracking.txt" >> "${adlistFile}"
-    echo "https://s3.amazonaws.com/lists.disconnect.me/simple_ad.txt" >> "${adlistFile}"
-    echo "https://hosts-file.net/ad_servers.txt" >> "${adlistFile}"
+    installDefaultBlocklists
 
     echo "::: Blocklists (${adlistFile}) now set to:"
     cat "${adlistFile}"
 }
+
+setup_var_exists() {
+    local KEY="$1"
+    if [ -n "$2" ]; then
+        local REQUIRED_VALUE="[^\n]+"
+    fi
+    if grep -Pq "^${KEY}=${REQUIRED_VALUE}" "$setupVars"; then
+        echo "::: Pre existing ${KEY} found"
+        true
+    else
+        false
+    fi
+}
+
